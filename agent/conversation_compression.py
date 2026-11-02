@@ -3137,66 +3137,6 @@ def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
     return new_system_prompt
 
 
-def _salvage_or_refuse_grown_transcript(
-    agent: Any, original_messages: list, compressed: list, *, system_message: str, attempt: _Attempt,
-) -> tuple[Optional[list], Optional[str]]:
-    """Anti-growth guard at the COMMIT SITE (in-place commits before the gateway can inspect).
-    Compares like-for-like rough estimates; on growth tries one mechanical salvage pass, else treats the
-    attempt as a refused no-op. Returns ``(compressed, None)`` to proceed or ``(None, prompt)`` when refused
-    (caller releases the lease)."""
-    # Anti-growth guard at the COMMIT SITE: never persist a compression that makes the transcript larger
-    # (observed: 379K -> 687K when the generated summary plus retained reasoning exceeded what it replaced).
-    # Compare like-for-like (both rough estimates of the same message shape) so an "actual vs estimate"
-    # measurement mismatch cannot produce a false verdict. The gateway has a rotation-path-only guard
-    # (#83339), but in-place compaction commits inside this method via archive_and_compact — before the
-    # gateway can inspect the result — so the guard must live here to protect both paths. On growth, treat
-    # the attempt as a no-op: the original transcript stays untouched and durable.
-    _rough_in = estimate_messages_tokens_rough(original_messages)
-    _rough_out = estimate_messages_tokens_rough(compressed)
-    if _rough_out > _rough_in:
-        # Todo refresh and user-turn anchoring run after the compressor's own size check
-        # and can tip a break-even candidate; give it one mechanical salvage pass.
-        from agent.context_compressor import salvage_grown_transcript
-        _salvaged = salvage_grown_transcript(original_messages, compressed, budget=_rough_in)
-        if _salvaged is not None:
-            _salv_est = estimate_messages_tokens_rough(_salvaged)
-            if _salv_est < _rough_in:
-                logger.info(
-                    "Compression salvage recovered a shrinking transcript (session=%s, ~%s -> ~%s tokens)",
-                    agent.session_id or "none", f"{_rough_in:,}", f"{_salv_est:,}",
-                )
-                compressed = _salvaged
-                _rough_out = _salv_est
-    if _rough_out > _rough_in:
-        logger.warning(
-            "Compression refused: compressed transcript would be larger than the original (session=%s, ~%s -> ~%s "
-            "tokens); keeping the original transcript unchanged", agent.session_id or "none",
-            f"{_rough_in:,}",
-            f"{_rough_out:,}",
-        )
-        # Flag the refusal on compressor state so /compress feedback reports it instead
-        # of comparing list lengths (adoption can change the count), claiming success.
-        with contextlib.suppress(Exception):
-            agent.context_compressor._last_compress_refused_would_grow = True
-        with contextlib.suppress(Exception):
-            agent._emit_warning(
-                "⚠️ Compression refused: the generated summary would have GROWN the conversation instead of "
-                "shrinking it. No messages were dropped — conversation continues unchanged."
-            )
-        _existing_sp = _existing_system_prompt(agent, system_message)
-        _emit_aborted_attempt_telemetry(agent, attempt.started_at, "would_grow", attempt.seed)
-        # Count the refusal as an ineffective-compaction strike so the anti-thrash
-        # breaker latches; otherwise auto-compress retries the same summary every turn.
-        with _swallow('could not record rejected-compaction strike', exc_info=True):
-            # Without this, the unchanged transcript stays over the compression threshold and automatic
-            # compression retries the identical summary request on every turn (#88568). Manual /compress
-            # keeps bypassing the latch (force=True skips the guards).
-            agent.context_compressor.record_rejected_compaction()
-        _restore_prune_rearm_tokens(agent.context_compressor, attempt.snapshot)
-        return None, _existing_sp
-    return compressed, None
-
-
 def _parent_deliberately_ended(session_db: Any, session_id: str) -> bool:
     """True when the parent row was ended by a non-automatic reason. Fails OPEN: an
     unreadable row must not turn a cheap guard into a new way to lose compression."""
@@ -3599,8 +3539,10 @@ def _commit_compaction(
             # inflate anti-growth or reach the provider. Track ids: salvage may subset list.
             _tail_tagged_ids = {id(m) for m in compressed if isinstance(m, dict) and m.pop("_compaction_tail", None)}
             original_messages = messages_before_compression if messages_before_compression is not None else messages
+            from agent.conversation_compression_refusal import _salvage_or_refuse_grown_transcript
             compressed, _refused_sp = _salvage_or_refuse_grown_transcript(
-                agent, original_messages, compressed, system_message=system_message, attempt=attempt,
+                agent, original_messages, compressed, system_message=system_message,
+                new_system_prompt=new_system_prompt, attempt=attempt,
             )
             if compressed is None:
                 return _CommitOutcome(

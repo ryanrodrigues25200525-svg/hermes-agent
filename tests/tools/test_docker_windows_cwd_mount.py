@@ -109,3 +109,60 @@ class TestToolsFollowTheMount:
             workdir=None, default_cwd=mount, session_key="sess", env_type="docker",
             mounted_host=host, env=env,
         ) == mount
+
+
+def _resolver(host_cwd=None, host_cwd_mount=None):
+    from tools.environments.docker import DockerEnvironment
+
+    env = object.__new__(DockerEnvironment)
+    env.host_cwd = host_cwd
+    env.host_cwd_mount = host_cwd_mount
+    return DockerEnvironment._resolve_container_cwd.__get__(env)
+
+
+class TestRunWorkdirTranslation:
+    """`docker run -w` must never receive a host path (exit 125, issue #148120)."""
+
+    def test_windows_cwd_under_wsl_volume_translates(self):
+        resolve = _resolver()
+        assert resolve(r"C:\djVaults\rrd52wsp-syndic",
+                       ["-v", "/mnt/c/djVaults:/workspace/djVaults"]) == \
+            "/workspace/djVaults/rrd52wsp-syndic"
+
+    def test_forward_slash_drive_cwd_translates(self):
+        resolve = _resolver()
+        assert resolve("C:/djVaults/proj",
+                       ["-v", "/mnt/c/djVaults:/workspace/djVaults"]) == \
+            "/workspace/djVaults/proj"
+
+    def test_exact_host_cwd_mount_wins(self):
+        resolve = _resolver(host_cwd=r"D:\Work\proj", host_cwd_mount="/host-cwd")
+        assert resolve(r"D:\Work\proj\sub", ["-v", r"D:\Work\proj:/host-cwd"]) == \
+            "/host-cwd/sub"
+
+    def test_unmapped_windows_cwd_falls_back_with_warning(self):
+        resolve = _resolver(host_cwd_mount="/host-cwd")
+        assert resolve(r"Z:\nowhere\proj", []) == "/host-cwd"
+        assert _resolver()(r"Z:\nowhere\proj", []) == "/workspace"
+
+    def test_sibling_directory_is_not_a_child(self):
+        resolve = _resolver()
+        assert resolve(r"C:\proj-other\x", ["-v", r"C:\proj:/data"]) == "/workspace"
+
+    def test_container_paths_and_relative_pass_through(self):
+        resolve = _resolver()
+        assert resolve("/workspace/keep", ["-v", "/mnt/c/djVaults:/workspace/djVaults"]) == \
+            "/workspace/keep"
+        assert resolve("subdir", []) == "subdir"
+        assert resolve("", []) == ""
+
+    def test_existing_mount_recognizes_a_covered_parent(self, monkeypatch):
+        """A volume over the parent dir counts: no redundant second bind."""
+        from tools.environments import docker as docker_mod
+
+        _preserve_drive_path(monkeypatch, r"C:\djVaults\rrd52wsp-syndic")
+        env, volume_args = _mount(["/mnt/c/djVaults:/workspace/djVaults"],
+                                   r"C:\djVaults\rrd52wsp-syndic", auto_mount=True)
+        specs = [arg for arg in volume_args if arg != "-v"]
+        assert not any(spec.startswith("C:") for spec in specs), specs
+        assert env.host_cwd_mount == "/workspace/djVaults/rrd52wsp-syndic"

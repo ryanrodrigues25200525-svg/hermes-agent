@@ -614,16 +614,63 @@ def _container_mount_taken(volume_args: list[str], mount: str) -> bool:
     return False
 
 
-def _existing_host_mount(volume_args: list[str], host_cwd_abs: str) -> str | None:
-    """Container path if a user volume already bind-mounts this host directory."""
-    want = _host_path_key(host_cwd_abs)
-    if not want:
+def _host_root_variants(host: str) -> list[str]:
+    """Comparable key forms of one host root: slash style, drive-letter case,
+    and WSL ``/mnt/<letter>/...`` ≡ ``<letter>:/...`` (a Windows project seen
+    from a WSL-hosted Docker shim, or the reverse)."""
+    key = _host_path_key(host)
+    if not key:
+        return []
+    variants = [key]
+    wsl = re.match(r"^/mnt/([a-z])/+(.*)$", key)
+    if wsl:
+        variants.append(f"{wsl.group(1)}:/{wsl.group(2)}".rstrip("/") or f"{wsl.group(1)}:/")
+    else:
+        drive = re.match(r"^([a-z]):(?:/(.*))?$", key)
+        if drive:
+            rest = drive.group(2) or ""
+            variants.append(f"/mnt/{drive.group(1)}/{rest}".rstrip("/") or f"/mnt/{drive.group(1)}")
+    return variants
+
+
+def _translate_through_mounts(path: str, mounts: list[tuple[str, str]]) -> str | None:
+    """Map *path* into the container via ``(host_root, container_root)`` pairs.
+
+    Longest host prefix wins; a sibling directory (``proj`` vs ``proj-other``)
+    never matches. The remainder keeps the host's letter case with forward
+    slashes, which is what the container bind shows. Returns None when no
+    mount covers the path.
+    """
+    key = _host_path_key(path)
+    if not key:
         return None
+    best: tuple[int, str] | None = None
+    for host_root, container_root in mounts:
+        for variant in _host_root_variants(host_root):
+            if key == variant:
+                rest = ""
+            elif key.startswith(variant.rstrip("/") + "/"):
+                rest = key[len(variant.rstrip("/")) + 1:]
+            else:
+                continue
+            mount = (container_root or "/").rstrip("/") or "/"
+            candidate = mount if not rest else f"{mount}/{rest}"
+            if best is None or len(variant) > best[0]:
+                best = (len(variant), candidate)
+    return best[1] if best is not None else None
+
+
+def _existing_host_mount(volume_args: list[str], host_cwd_abs: str) -> str | None:
+    """Container path if a user volume already bind-mounts this host directory
+    or a parent of it (the remainder is appended to the container path)."""
+    if not host_cwd_abs:
+        return None
+    mounts = []
     for arg in volume_args:
         parsed = _split_volume_spec(arg)
-        if parsed and _host_path_key(parsed[0]) == want:
-            return parsed[1]
-    return None
+        if parsed:
+            mounts.append(parsed)
+    return _translate_through_mounts(host_cwd_abs, mounts)
 
 
 def _free_host_cwd_mount(volume_args: list[str]) -> str:
@@ -710,6 +757,10 @@ class DockerEnvironment(BaseEnvironment):
                 mount, cwd)
             cwd = mount
             self.cwd = mount
+        resolved = self._resolve_container_cwd(cwd, volume_args)
+        if resolved != cwd:
+            cwd = resolved
+            self.cwd = resolved
         volume_args.extend(_readonly_skill_mount_args())
         egress_label, egress_volume_args, egress_host_args, env_args, validated_extra = (
             self._egress_and_env_args(extra_args))
@@ -924,6 +975,40 @@ class DockerEnvironment(BaseEnvironment):
         elif workspace_explicitly_mounted and not existing_mount:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
         return volume_args, writable_args
+
+    def _resolve_container_cwd(self, cwd: str, volume_args: list[str]) -> str:
+        """Translate a host-form workdir into the container, or fall back safely.
+
+        ``docker run -w`` needs an absolute in-sandbox path (exit 125
+        otherwise). A Windows drive path or a host path under a configured
+        volume is mapped through the longest covering mount; a host path
+        with no covering mount falls back to the session mount (or
+        ``/workspace``) with a warning instead of killing the sandbox.
+        Anything else is left untouched.
+        """
+        if not cwd or not (_is_windows_drive_path(cwd) or os.path.isabs(cwd)):
+            return cwd
+        mounts: list[tuple[str, str]] = []
+        if self.host_cwd:
+            mounts.append((self.host_cwd, self.host_cwd_mount or "/workspace"))
+        for arg in volume_args:
+            if arg == "-v":
+                continue
+            parsed = _split_volume_spec(arg)
+            if parsed:
+                mounts.append(parsed)
+        translated = _translate_through_mounts(cwd, mounts)
+        if translated is not None:
+            if translated != cwd:
+                logger.info("Container cwd translates host path %s to %s", cwd, translated)
+            return translated
+        if _is_windows_drive_path(cwd):
+            fallback = self.host_cwd_mount or "/workspace"
+            logger.warning(
+                "No volume covers host workdir %s; starting the container at %s instead",
+                cwd, fallback)
+            return fallback
+        return cwd
 
     def _attach_existing_container(self, task_label, profile_name, egress_label, network: bool) -> bool:
         """Attach to a prior process's labeled container ("ONE long-lived container shared

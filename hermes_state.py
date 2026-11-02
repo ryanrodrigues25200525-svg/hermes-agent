@@ -582,7 +582,15 @@ class SessionDB(
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
     def __init__(self, db_path: Path | None = None, read_only: bool = False):
-        self.db_path = db_path or _default_db_path()
+        raw_path = db_path or _default_db_path()
+        try:
+            # Canonicalize symlinks (macOS /var -> /private/var) so every
+            # handle names the same file the registry keys on: acquire()
+            # resolves before keying, and an unresolved handle here compared
+            # unequal to the child's resolved one for the identical database.
+            self.db_path = Path(raw_path).resolve()
+        except OSError:
+            self.db_path = Path(raw_path)
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
         # Keep only the opening call site, never a frame (which pins caller locals).

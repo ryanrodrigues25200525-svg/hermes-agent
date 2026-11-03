@@ -195,7 +195,7 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[dict[str, Any]]:
         # Rebuild from whitelisted fields only: stored SDK text blocks carry output-only siblings
         # (parsed_output, citations=None) that the INPUT schema rejects with 400.
         block = _text_block_with_citations(part.get("text", ""), part.get("citations") if ptype == "text" else None)
-    elif ptype in {"image_url", "input_image"}:
+    elif ptype in ("image_url", "input_image"):
         image_value = part.get("image_url", {})
         url = image_value.get("url", "") if isinstance(image_value, dict) else str(image_value or "")
         block = _image_block_from_openai_url(url)

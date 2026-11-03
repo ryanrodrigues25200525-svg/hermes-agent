@@ -4389,7 +4389,7 @@ def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int
                 resized, unshrinkable = _shrink(_source_to_data_url(source) or "")
                 if resized and isinstance(source, dict):
                     replacement = {**part, "source": _write_data_url_to_source(source, resized)}
-            elif ptype in {"image_url", "input_image"}:
+            elif ptype in ("image_url", "input_image"):
                 image_value = part.get("image_url")
                 # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
                 # OpenAI Responses: {"image_url": "data:..."}

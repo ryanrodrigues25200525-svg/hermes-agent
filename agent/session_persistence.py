@@ -210,13 +210,59 @@ def _db_flush_store_uids(agent) -> set:
 
 
 def _db_flush_scan_start(agent, messages: list[dict]) -> int:
-    """Skip the identity-matched, still-marked prefix of the previous flush's snapshot."""
+    """Skip the identity-matched, still-marked prefix of the previous flush's snapshot.
+
+    ``scan_start == 0`` also means "the list was rebuilt" (compaction, retry, resumed turn):
+    fresh dicts share no identity with the snapshot and carry no marker. That case is
+    flagged for the durable-key probe below instead of reading as "nothing durable yet".
+    """
+    snapshot = getattr(agent, "_db_flush_scan_prefix", None) or ()
     scan_start = 0
-    for prev, cur in zip(getattr(agent, "_db_flush_scan_prefix", None) or (), messages):
+    for prev, cur in zip(snapshot, messages):
         if cur is not prev or not cur.get(_DB_PERSISTED_MARKER):
             break
         scan_start += 1
+    agent._db_flush_list_rebuilt = bool(snapshot) and scan_start == 0 and bool(messages)
     return scan_start
+
+
+def _db_flush_durable_keys(agent) -> Optional[dict]:
+    """``(timestamp, role, tool_call_id) -> longest stored content`` for this session, or
+    ``None`` when the probe is unavailable (no DB handle / query failure / explicit replay).
+
+    Returning ``None`` keeps the old behaviour rather than guessing: a probe outage must
+    never turn into dropped writes.
+    """
+    db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if db is None or not session_id:
+        return None
+    try:
+        return db.conversation_keys(session_id)
+    except Exception as exc:  # health: allow BLE001 -- degrade to the old path, never fail the turn
+        logger.debug("durable-key probe failed for %s: %s", session_id, exc)
+        return None
+
+
+def _db_flush_already_stored(durable: dict, row: dict) -> bool:
+    """True when the DB already holds this message at equal-or-greater length.
+
+    Compaction rewrites carry the original timestamp and a *shorter* tool body,
+    so "not longer" keeps the full text and drops the stub. A longer body
+    updates the entry so a richer later rewrite still lands.
+    """
+    try:
+        key = (float(row.get("timestamp")), row.get("role"), row.get("tool_call_id") or "")
+    except (TypeError, ValueError):
+        return False
+    known = durable.get(key)
+    if known is None:
+        return False
+    length = len(row.get("content") or "")
+    if length <= known:
+        return True
+    durable[key] = length
+    return False
 
 
 def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any]:
@@ -322,6 +368,9 @@ def _db_flush_collect(agent, messages: list[dict], conversation_history: Optiona
     # resolve_and_repair_transcript_batch skips it only if that uid is still ACTIVE, inside the write
     # transaction, and never for a snapshot-carrying dict (the CAS rewrite owns its live edit).
     store_uids = _db_flush_store_uids(agent)
+    # Durability as a database fact. ``replay_history`` is the one path that INTENDS to
+    # rewrite the prefix (a recreated session row), so it deliberately skips the probe.
+    durable = None if replay_history else _db_flush_durable_keys(agent)
     for msg_idx in range(_db_flush_scan_start(agent, messages), len(messages)):
         msg = messages[msg_idx]
         # Append-only flush: a mid-turn persist of scaffolding would commit a synthetic turn the end-of-turn
@@ -355,6 +404,12 @@ def _db_flush_collect(agent, messages: list[dict], conversation_history: Optiona
         row = _db_flush_row(agent, msg, ov_idx == msg_idx or msg is pending_cli_message)
         if uid is not None and uid in store_uids:
             row[RESTORED_FROM_STORE] = True
+        if durable is not None and _db_flush_already_stored(durable, row):
+            # Rebuilt list, demoted rewrite, or resumed session: the DB already holds
+            # this message at equal-or-greater length. Stamp it and move on instead
+            # of inserting a duplicate row (#148114).
+            msg[_DB_PERSISTED_MARKER] = True
+            continue
         batch_rows.append(row)
         batch_msgs.append(msg)
     return batch_rows, batch_msgs

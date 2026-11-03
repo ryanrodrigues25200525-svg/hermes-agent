@@ -616,6 +616,19 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             "AND role NOT IN ('session_meta', 'system') ORDER BY id DESC LIMIT 1", (session_id,))
         return row[0] if row else None
 
+    def conversation_keys(self, session_id: str) -> dict[tuple, int]:
+        """Durable identity of stored messages: ``(timestamp, role, tool_call_id)`` → longest content (#148114)."""
+        if not session_id: return {}
+        rows = self._read_all(
+            "SELECT timestamp, role, IFNULL(tool_call_id, ''), MAX(LENGTH(IFNULL(content, ''))) "
+            "FROM messages WHERE session_id = ? GROUP BY timestamp, role, IFNULL(tool_call_id, '')",
+            (session_id,))
+        return {
+            (float(row[0]), row[1], row[2]): int(row[3] or 0)
+            for row in rows or ()
+            if isinstance(row[0], (int, float))
+        }
+
     def get_message_role(self, session_id: str, row_id: int) -> Optional[str]:
         """Role of the active message at *row_id* in *session_id*, or ``None``."""
         if not session_id:

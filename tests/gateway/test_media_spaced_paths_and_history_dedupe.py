@@ -15,6 +15,8 @@ Covers the follow-up wave after PR #72170:
 
 import os
 
+import pytest
+
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -96,3 +98,39 @@ class TestHistoryMediaDedupe:
 
     def test_empty_history_empty_set(self):
         assert _collect_history_media_paths([]) == set()
+
+
+class TestNormalizedSpellingDedupe:
+    """#148565: the two scan passes can spell one file two ways (``D:/...``
+    vs ``D:\\...``). Dedupe runs on the normalized path, so it uploads once."""
+
+    def test_dot_segment_spellings_upload_once(self, tmp_path):
+        # The known-extension pass takes the path as written while the
+        # fallback pass resolves it; without normalized-key dedupe the same
+        # file uploads twice (#148565).
+        d = tmp_path / "my dir"
+        d.mkdir()
+        p = d / "a.docx"
+        p.write_text("x\n")
+        media, _ = BasePlatformAdapter.extract_media(
+            f"MEDIA:{p} MEDIA:{d}/./a.docx"
+        )
+        assert [path for path, _ in media] == [str(p)]
+
+    def test_genuinely_different_files_still_both_upload(self, tmp_path):
+        a = tmp_path / "a.log"
+        b = tmp_path / "b.log"
+        a.write_text("a\n")
+        b.write_text("b\n")
+        media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{a} MEDIA:{b}")
+        assert sorted(path for path, _ in media) == sorted([str(a), str(b)])
+
+    @pytest.mark.platforms("windows")
+    def test_forward_and_backslash_spellings_upload_once(self, tmp_path):
+        d = tmp_path / "my dir"
+        d.mkdir()
+        p = d / "a.log"
+        p.write_text("x\n")
+        fwd = str(p).replace("\\", "/")
+        media, _ = BasePlatformAdapter.extract_media(f"MEDIA:{fwd} MEDIA:{p}")
+        assert len(media) == 1

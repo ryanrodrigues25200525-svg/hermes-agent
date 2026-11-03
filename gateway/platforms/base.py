@@ -3208,28 +3208,27 @@ class BasePlatformAdapter(ABC):
         media = []
         has_voice_tag = "[[audio_as_voice]]" in content
         cleaned = content.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
-        # Scan a masked copy so example/stored MEDIA paths (code, quotes, JSON values) are never
-        # delivered; dedupe on the expanded path so a file referenced twice uploads once.
+        # Scan a masked copy so example/stored MEDIA paths are never delivered (#35695 #34375).
+        # Dedupe on the normalized path (first occurrence wins) so one file spelled two
+        # ways uploads once, not twice (#148565, #29131).
         scan_content = _mask_media_scan_text(content)
-        # - code blocks / inline code / blockquotes hold prose examples (#35695) - serialized JSON string
-        #   values hold stored tool-result text (#34375) Both maskers are offset-preserving (chars ->
-        #   spaces) so match offsets stay valid; chaining them masks the union of both protected regions.
-        # Dedupe on the expanded path (first occurrence wins) so the same file referenced twice in one
-        # response — e.g. a MEDIA tag inline AND in a summary footer — is uploaded once, not twice (#29131).
         seen_paths: set = set()
 
         def _add(path: str) -> None:
-            # is_voice only for audio: a voice-flagged image would leave the photo batch.
-            if path not in seen_paths:
-                seen_paths.add(path)
-                media.append((path, has_voice_tag and os.path.splitext(path)[1].lower() in _AUDIO_EXTS))
+            # is_voice only for audio (a voice-flagged image would leave the photo batch);
+            # dedupe on the normalized path so one file spelled two ways uploads once (#148565).
+            try:
+                expanded = os.path.expanduser(path)
+                key = os.path.normcase(os.path.normpath(expanded))
+            except (OSError, RuntimeError, ValueError):
+                return
+            if key not in seen_paths:
+                seen_paths.add(key)
+                media.append((expanded, has_voice_tag and os.path.splitext(expanded)[1].lower() in _AUDIO_EXTS))
         for match in MEDIA_TAG_CLEANUP_RE.finditer(scan_content):
             path = _normalize_media_tag_path(match.group("path"))
             if path:
-                try:
-                    _add(os.path.expanduser(path))
-                except (OSError, RuntimeError, ValueError):
-                    continue  # crafted ~\x00 path: skip it, keep the rest
+                _add(path)
         for _, safe_path, _ in _extensionless_media_matches(scan_content):
             _add(safe_path)
         # Locate tag spans on a masked copy, delete them from the unmasked text (protected spans

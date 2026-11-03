@@ -37,6 +37,19 @@ class ManagedExecutionUnknown(RuntimeError):
     """The committed unknown verdict stops the FIFO without forging failed settlement."""
 
 
+def _managed_workers_enabled(config: Any) -> bool:
+    """True only when the gateway mapping opts the session into managed workers.
+
+    Profile configs may carry ``gateway: running`` (a status string) where the
+    global config carries the ``gateway:`` mapping — a non-dict must fail
+    closed to False, never crash the lookup (#148585).
+    """
+    if not isinstance(config, dict):
+        return False
+    gateway = config.get('gateway', {})
+    return isinstance(gateway, dict) and gateway.get('managed_workers') is True
+
+
 def managed_policy(authority, ref):
     """Bypass (safe / config-only) sessions always execute out of process; other local
     sessions only under the explicit custom-provider opt-in.
@@ -49,7 +62,7 @@ def managed_policy(authority, ref):
         return None
     if policy.ignore_user_config or policy.kanban_json is not None:
         return policy
-    if policy.config().get('gateway', {}).get('managed_workers') is not True:
+    if not _managed_workers_enabled(policy.config()):
         return None
     request = json.loads(policy.request_json)
     if policy.platform != 'cli' or request.get('provider') != 'custom' or not request.get('base_url'):
